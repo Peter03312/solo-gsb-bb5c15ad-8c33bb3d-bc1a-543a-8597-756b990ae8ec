@@ -9,7 +9,11 @@
   相交（即 ``t < b 且 a < t+w``），就不允许在第 ``t`` 分钟进入该通道；
   最早可尝试进入的下一分钟为 ``b``。
 * 容量按每分钟核算：同一通道同一分钟，所有在途组（已出发固定组 + 本轮
-  已排入的待出发组）人数之和不得超过该通道每分钟容量。
+  已排入的待出发组）人数之和不得超过该通道该分钟的**有效上限**。
+* 容量管制时段同样为左闭右开 ``[a, b)``：时段内该通道的有效上限为登记的
+  管制上限，时段外仍用通道原容量；同一通道的管制时段两两不重叠，因此
+  任意一分钟至多命中一个管制时段。管制属于容量约束，放松容量约束的
+  归因搜索同时放松管制。
 
 择优规则
 --------
@@ -45,12 +49,23 @@ class World:
     exits: list[int]
     # edge_id -> 已按开始分钟升序排列的 [(a, b), ...]
     closures: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
+    # edge_id -> 已按开始分钟升序排列的 [(a, b, cap), ...]（两两不重叠）
+    controls: dict[int, list[tuple[int, int, int]]] = field(default_factory=dict)
     # (edge_id, minute) -> 已固定（已出发）组在该分钟占用的总人数
     fixed_load: dict[tuple[int, int], int] = field(default_factory=dict)
 
 
 class PlanningError(Exception):
     """规划过程内部错误（如图结构异常等）。"""
+
+
+def _minute_capacity(edge: Edge, windows: list[tuple[int, int, int]],
+                     minute: int) -> int:
+    """通道在某一分钟的有效上限：命中管制时段用管制上限，否则用原容量。"""
+    for a, b, cap in windows:
+        if a <= minute < b:
+            return cap
+    return edge.capacity
 
 
 def _dominates(a_time: int, a_seq: tuple[int, ...],
@@ -64,7 +79,8 @@ def earliest_entry(edge: Edge, start: int, size: int, world: World,
                    use_loads: bool) -> Optional[int]:
     """返回最早的可进入分钟 t >= start，使 [t, t+w) 完全可用。
 
-    不可用包括：与封闭时段相交、某一分钟容量不足。均不满足（或无法在
+    不可用包括：与封闭时段相交、某一分钟占用达到该分钟有效上限
+    （管制时段内为管制上限，时段外为通道原容量）。均不满足（或无法在
     horizon 前完成通行）时返回 None。
     """
     eid = edge.id
@@ -73,6 +89,16 @@ def earliest_entry(edge: Edge, start: int, size: int, world: World,
     if t + w > horizon:
         return None
     closures = world.closures.get(eid, ())
+    windows = world.controls.get(eid, ())
+    if use_loads:
+        # 单组人数超过通行期间任何一分钟可能达到的最大有效上限，
+        # 则永不可通行（逐分钟检查只会不断后推直至越过 horizon）
+        max_cap = edge.capacity
+        for _, _, cap in windows:
+            if cap > max_cap:
+                max_cap = cap
+        if size > max_cap:
+            return None
     while t + w <= horizon:
         advanced = False
         if use_closures:
@@ -88,12 +114,11 @@ def earliest_entry(edge: Edge, start: int, size: int, world: World,
             if advanced:
                 continue
         if use_loads:
-            if size > edge.capacity:
-                return None  # 单组人数已超通道每分钟容量，永不可通行
             for minute in range(t, t + w):
+                cap = _minute_capacity(edge, windows, minute)
                 used = world.fixed_load.get((eid, minute), 0)
-                if used + size > edge.capacity:
-                    # 容量冲突的这一分钟不能进入；下一分钟再尝试
+                if used + size > cap:
+                    # 这一分钟有效上限不足，不能进入；下一分钟再尝试
                     t = minute + 1
                     advanced = True
                     break

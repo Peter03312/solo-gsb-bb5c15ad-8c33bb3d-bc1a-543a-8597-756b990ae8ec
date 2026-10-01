@@ -6,7 +6,7 @@ import pytest
 from app.planner import Edge, World, plan_group
 
 
-def build_world(edges, exits, closures=(), fixed_load=None):
+def build_world(edges, exits, closures=(), fixed_load=None, controls=()):
     edge_map = {e.id: e for e in edges}
     adj: dict[int, list[int]] = {}
     for e in edges:
@@ -16,8 +16,12 @@ def build_world(edges, exits, closures=(), fixed_load=None):
     clo: dict[int, list[tuple[int, int]]] = {}
     for eid, a, b in closures:
         clo.setdefault(eid, []).append((a, b))
+    ctl: dict[int, list[tuple[int, int, int]]] = {}
+    for eid, a, b, cap in controls:
+        ctl.setdefault(eid, []).append((a, b, cap))
     return World(edges=edge_map, adjacency=adj, exits=list(exits),
-                 closures=clo, fixed_load=dict(fixed_load or {}))
+                 closures=clo, controls=ctl,
+                 fixed_load=dict(fixed_load or {}))
 
 
 def plan(world, gid=1, size=10, origin=1, earliest=0, deadline=100, now=0):
@@ -173,3 +177,56 @@ def test_per_minute_capacity_partial_overlap():
     b = plan(world, gid=2, size=20, deadline=20)
     # 容量 30，不能在 2..6 任一分钟与 A 同时在途（20+20>30），最早第 6 分钟
     assert b["steps"][0]["enter_minute"] == 6
+
+
+# --------------------------------------------------------------------------
+# 容量管制时段（有效上限按分钟核算）
+# --------------------------------------------------------------------------
+
+def test_control_window_forces_wait():
+    # 管制 [1,6) 上限 20 < 25：通行区间 [t,t+4) 不能覆盖任何管制分钟，
+    # 最早第 6 分钟进入（时段外仍用原容量 30）
+    world = build_world(
+        [Edge(1, 1, 2, 4, 30), Edge(2, 2, 3, 1, 30)],
+        exits=[3], controls=[(1, 1, 6, 20)])
+    r = plan(world, size=25, deadline=20)
+    assert r["status"] == "scheduled"
+    assert r["steps"][0]["enter_minute"] == 6
+    assert r["arrival_minute"] == 11
+
+
+def test_control_window_exact_fit_passes():
+    # 管制上限恰好等于组人数：逐分钟核算通过，t=0 进入
+    world = build_world(
+        [Edge(1, 1, 2, 4, 30)], exits=[2], controls=[(1, 1, 3, 25)])
+    r = plan(world, size=25, deadline=20)
+    assert r["status"] == "scheduled"
+    assert r["steps"][0]["enter_minute"] == 0
+
+
+def test_control_window_higher_than_base_capacity():
+    # 管制上限 40 高于原容量 30：35 人组只能整体落入时段 [2,8) 内，
+    # 最早第 2 分钟进入
+    world = build_world(
+        [Edge(1, 1, 2, 4, 30)], exits=[2], controls=[(1, 2, 8, 40)])
+    r = plan(world, size=35, deadline=20)
+    assert r["status"] == "scheduled"
+    assert r["steps"][0]["enter_minute"] == 2
+
+
+def test_control_window_too_small_everywhere_fails():
+    # 组人数超过任何一分钟的有效上限（原容量与管制上限都容不下）
+    world = build_world(
+        [Edge(1, 1, 2, 4, 30)], exits=[2], controls=[(1, 0, 100, 10)])
+    r = plan(world, size=31, deadline=200)
+    assert r["status"] == "failed"
+    assert r["reason"] == "INSUFFICIENT_CAPACITY"
+
+
+def test_control_window_capacity_reason_attribution():
+    # 管制属于容量约束：放松容量（含管制）后可达 -> INSUFFICIENT_CAPACITY
+    world = build_world(
+        [Edge(1, 1, 2, 4, 30)], exits=[2], controls=[(1, 0, 50, 5)])
+    r = plan(world, size=10, deadline=10)
+    assert r["status"] == "failed"
+    assert r["reason"] == "INSUFFICIENT_CAPACITY"

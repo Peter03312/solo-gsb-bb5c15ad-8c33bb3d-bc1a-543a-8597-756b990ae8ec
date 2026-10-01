@@ -32,6 +32,31 @@ class ClosureIn(BaseModel):
         return self
 
 
+class ControlIn(BaseModel):
+    """容量管制时段：左闭右开 [start_minute, end_minute) 内有效上限为 capacity。"""
+    edge_id: int = Field(..., description="被管制的通道编号")
+    start_minute: int = Field(..., ge=0, description="管制开始分钟（含，不得早于当前分钟）")
+    end_minute: int = Field(..., ge=0, description="管制结束分钟（不含）")
+    capacity: int = Field(..., gt=0, description="管制时段内每分钟有效上限（正整数）")
+
+    @model_validator(mode="after")
+    def _half_open(self):
+        if self.end_minute <= self.start_minute:
+            raise ValueError("管制时段需为左闭右开：end_minute 必须大于 start_minute")
+        return self
+
+
+class ControlOut(BaseModel):
+    edge_id: int
+    start_minute: int
+    end_minute: int
+    capacity: int
+
+
+class ControlListOut(BaseModel):
+    controls: list[ControlOut]
+
+
 class GroupIn(BaseModel):
     id: int = Field(..., ge=1, description="人群组编号（正整数，唯一）")
     size: int = Field(..., gt=0, description="人数（正整数，整组不可拆分）")
@@ -87,6 +112,17 @@ class ConflictOut(BaseModel):
     closure: list[int] = Field(description="与之相交的封闭时段 [start,end)")
 
 
+class ControlConflictOut(BaseModel):
+    """新管制上限使已出发组剩余路线在某一分钟超载的冲突明细。"""
+    edge_id: int
+    minute: int = Field(description="超载发生的分钟")
+    used: int = Field(description="该分钟已出发组的占用人数")
+    capacity: int = Field(description="请求登记的新管制上限")
+    groups: list[dict] = Field(
+        description="该分钟在途的已出发组，如 "
+                    "[{\"group_id\": 3, \"size\": 10}]")
+
+
 # --------------------------------------------------------------------------
 # 修订历史（编排变更追溯）
 # --------------------------------------------------------------------------
@@ -108,7 +144,7 @@ class RevisionSummaryOut(BaseModel):
     rev: int = Field(description="全局递增修订号（按实际提交顺序编号）")
     operation: str = Field(
         description="触发操作：scenario=场景重置 | groups=新增人群组 | "
-                    "closures=登记封闭 | tick=时间推进")
+                    "closures=登记封闭 | controls=登记容量管制 | tick=时间推进")
     minute: int = Field(description="该修订提交后的当前分钟")
     detail: dict = Field(default_factory=dict, description="触发操作的参数摘要")
 

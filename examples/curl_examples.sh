@@ -65,15 +65,39 @@ curl -s "$BASE/plan" | python3 -m json.tool
 say "9) 查询通道 1 每分钟容量占用（核验不超容量）"
 curl -s "$BASE/passages/1/load" | python3 -m json.tool
 
-say "10) 列出修订历史（每次成功变更一条，被拒绝的请求不产生）"
+say "10) 登记容量管制时段：通道 1 在 [12,16) 内限流为每分钟 25 人"
+# 组1（30 人）无法在该时段通行通道1，重排后推迟到第 16 分钟进入；
+# 组7（25 人）仍可在时段内通行（25<=25），时段外仍按原容量 30 核算
+curl -s -X POST "$BASE/controls" \
+  -H 'Content-Type: application/json' \
+  -d '{"edge_id": 1, "start_minute": 12, "end_minute": 16, "capacity": 25}' \
+  | python3 -m json.tool
+
+say "11) 查询当前管制列表，并看通道 1 各分钟的有效上限（12、13 分钟为 25）"
+curl -s "$BASE/controls" | python3 -m json.tool
+curl -s "$BASE/passages/1/load" | python3 -m json.tool
+
+say "12) 尝试登记使已出发组超载的管制（组3在通道5剩余[1,2)占用10人>上限5，预期 HTTP 409）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/controls" \
+  -H 'Content-Type: application/json' \
+  -d '{"edge_id": 5, "start_minute": 1, "end_minute": 3, "capacity": 5}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "13) 尝试登记与既有时段重叠的管制（与通道1的[12,16)相交，预期 HTTP 409）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/controls" \
+  -H 'Content-Type: application/json' \
+  -d '{"edge_id": 1, "start_minute": 14, "end_minute": 20, "capacity": 8}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "14) 列出修订历史（每次成功变更一条，被拒绝的请求不产生）"
 curl -s "$BASE/revisions" | python3 -m json.tool
 
-say "11) 按修订号查询：当时编排快照 + 各组前后差异（取最新一条）"
+say "15) 按修订号查询：当时编排快照 + 各组前后差异（取最新一条）"
 LATEST=$(curl -s "$BASE/revisions" | python3 -c \
   'import json,sys; print(json.load(sys.stdin)["revisions"][-1]["rev"])')
 curl -s "$BASE/revisions/$LATEST" | python3 -m json.tool
 
-say "12) 查询未知修订号（预期 HTTP 404）"
+say "16) 查询未知修订号（预期 HTTP 404）"
 curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' "$BASE/revisions/999999"
 python3 -m json.tool /tmp/resp.json || true
 

@@ -93,6 +93,35 @@ if __name__ == "__main__":
     show("拒绝后查询，原编排保持不变", status, plan)
     summarize(plan)
 
+    # ---- 容量管制（临时限流）----
+    # 通道 1 在 [5,12) 内限流为每分钟 10 人：组 1（30 人）无法在该时段
+    # 通行通道 1，重排后推迟到第 12 分钟进入；时段外仍按原容量 30 核算
+    status, plan = call("POST", "/controls",
+                        {"edge_id": 1, "start_minute": 5, "end_minute": 12,
+                         "capacity": 10})
+    show("登记容量管制：通道1 [5,12) 上限 10", status, plan)
+    summarize(plan)
+
+    status, payload = call("GET", "/controls")
+    show("当前登记的管制时段", status, payload)
+
+    # 占用查询的每个分钟槽位附带 effective_capacity（时段内为管制上限）
+    status, payload = call("GET", "/passages/1/load")
+    show("通道 1 逐分钟占用与有效上限", status, payload)
+
+    # 组 3 已出发，剩余占用通道 5 的 [1,2)（10 人）；上限 5 会超载 -> 409
+    status, payload = call("POST", "/controls",
+                           {"edge_id": 5, "start_minute": 1, "end_minute": 3,
+                            "capacity": 5})
+    show("使已出发组超载的管制（预期 409，含冲突分钟/占用量/相关组）",
+         status, payload)
+
+    # 与通道 1 既有时段 [5,12) 重叠 -> 409
+    status, payload = call("POST", "/controls",
+                           {"edge_id": 1, "start_minute": 6,
+                            "end_minute": 20, "capacity": 8})
+    show("与既有时段重叠的管制（预期 409）", status, payload)
+
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")
     show("修订列表（每次成功变更一条，拒绝不产生）", status, payload)
