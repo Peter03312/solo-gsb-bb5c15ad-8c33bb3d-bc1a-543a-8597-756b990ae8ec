@@ -173,3 +173,70 @@ def test_per_minute_capacity_partial_overlap():
     b = plan(world, gid=2, size=20, deadline=20)
     # 容量 30，不能在 2..6 任一分钟与 A 同时在途（20+20>30），最早第 6 分钟
     assert b["steps"][0]["enter_minute"] == 6
+
+
+# --------------------------------------------------------------------------
+# 容量管制时段（有效上限 = min(原容量, 管制上限)，按每分钟核算）
+# --------------------------------------------------------------------------
+
+def test_capacity_control_forces_wait_until_window_end():
+    # 通道 1 容量 30，管制 [2,6) 上限 10；组 20 人：
+    # t=0 进入占用 [0,4)，分钟 2、3 有效上限 10 < 20 -> 不可；
+    # 单组人数超管制上限，直接跳到管制结束分钟 6
+    world = build_world(
+        [Edge(1, 1, 2, 4, 30), Edge(2, 2, 3, 1, 30)], exits=[3])
+    world.capacity_controls[1] = [(2, 6, 10)]
+    r = plan(world, size=20)
+    assert r["status"] == "scheduled"
+    assert r["steps"][0]["enter_minute"] == 6
+    assert r["arrival_minute"] == 11
+
+
+def test_capacity_control_partial_window_blocks_entry():
+    # 通行 4 分钟，管制 [3,5) 上限 10，组 20 人：
+    # t=0/1/2 的占用区间均含管制分钟 -> 不可；t=5 起管制外 -> 可
+    world = build_world([Edge(1, 1, 2, 4, 30)], exits=[2])
+    world.capacity_controls[1] = [(3, 5, 10)]
+    r = plan(world, size=20)
+    assert r["steps"][0]["enter_minute"] == 5
+
+
+def test_capacity_control_outside_window_uses_base_capacity():
+    # 管制 [10,20) 上限 5，组 30 人（=原容量）：管制外分钟照常可通行
+    world = build_world([Edge(1, 1, 2, 2, 30)], exits=[2])
+    world.capacity_controls[1] = [(10, 20, 5)]
+    r = plan(world, size=30)
+    assert r["status"] == "scheduled"
+    assert r["departure_minute"] == 0
+    assert r["arrival_minute"] == 2
+
+
+def test_capacity_control_above_base_capacity_is_noop():
+    # 管制上限高于原容量：有效上限仍为原容量（管制只收紧不放松）
+    world = build_world([Edge(1, 1, 2, 2, 30)], exits=[2])
+    world.capacity_controls[1] = [(0, 100, 50)]
+    r = plan(world, size=30)
+    assert r["status"] == "scheduled"
+    assert r["departure_minute"] == 0
+
+
+def test_capacity_control_with_fixed_load():
+    # 管制 [0,10) 上限 25；A 20 人 t=0 进入占用 [0,4)；
+    # B 10 人：分钟 0..3 有效上限 25，20+10>25 -> 等到 A 走完后 t=4
+    world = build_world([Edge(1, 1, 2, 4, 30)], exits=[2])
+    world.capacity_controls[1] = [(0, 10, 25)]
+    a = plan(world, gid=1, size=20)
+    assert a["steps"][0]["enter_minute"] == 0
+    for k, v in a["load_delta"].items():
+        world.fixed_load[k] = world.fixed_load.get(k, 0) + v
+    b = plan(world, gid=2, size=10)
+    assert b["steps"][0]["enter_minute"] == 4
+
+
+def test_capacity_control_blocking_all_windows_reason():
+    # 唯一通道全程管制 [0,50) 上限 5，组 6 人截止 10 -> 容量原因失败
+    world = build_world([Edge(1, 1, 2, 4, 100)], exits=[2])
+    world.capacity_controls[1] = [(0, 50, 5)]
+    r = plan(world, size=6, deadline=10)
+    assert r["status"] == "failed"
+    assert r["reason"] == "INSUFFICIENT_CAPACITY"

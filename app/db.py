@@ -30,6 +30,16 @@ CREATE TABLE IF NOT EXISTS closures (
     end_minute   INTEGER NOT NULL
 );
 
+-- 容量管制时段（临时限流）：左闭右开 [start_minute, end_minute)，
+-- 时段内该通道每分钟有效上限收紧为 capacity；同一通道的时段互不重叠
+CREATE TABLE IF NOT EXISTS capacity_controls (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    edge_id      INTEGER NOT NULL,
+    start_minute INTEGER NOT NULL,
+    end_minute   INTEGER NOT NULL,
+    capacity     INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS groups (
     id                 INTEGER PRIMARY KEY,
     size               INTEGER NOT NULL,
@@ -56,13 +66,14 @@ CREATE TABLE IF NOT EXISTS route_steps (
     PRIMARY KEY (group_id, seq)
 );
 
--- 修订历史：每次成功的编排变更（场景重置/新增组/登记封闭/推进时间）
--- 与编排变更在同一事务内写入；快照为提交时刻的完整编排 JSON，
+-- 修订历史：每次成功的编排变更（场景重置/新增组/登记封闭/登记容量管制/
+-- 推进时间）与编排变更在同一事务内写入；快照为提交时刻的完整编排 JSON，
 -- 落库后不再改动、查询时不按当前场景重算。场景重置（reset_db）
 -- 与服务重启均不影响本表。
 CREATE TABLE IF NOT EXISTS revisions (
     rev         INTEGER PRIMARY KEY,  -- 全局递增修订号（按实际提交顺序）
-    operation   TEXT NOT NULL,        -- scenario | groups | closures | tick
+    operation   TEXT NOT NULL,        -- scenario | groups | closures |
+                                      -- capacity-controls | tick
     detail      TEXT NOT NULL,        -- JSON：触发操作的参数摘要
     minute      INTEGER NOT NULL,     -- 该修订提交后的当前分钟
     plan_before TEXT NOT NULL,        -- JSON：提交前完整编排（PlanResponse）
@@ -84,7 +95,8 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订历史（revisions 表）不在清空之列：场景重置后旧修订仍可查询，
     修订号继续全局递增。
     """
-    for table in ("route_steps", "groups", "closures", "exits", "edges", "meta"):
+    for table in ("route_steps", "groups", "closures", "capacity_controls",
+                  "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
     await db.execute(
         "INSERT INTO meta(key, value) VALUES('current_minute', 0)")
@@ -143,6 +155,14 @@ async def load_world(db: aiosqlite.Connection):
     for segs in closures.values():
         segs.sort()
 
+    capacity_controls: dict[int, list[tuple[int, int, int]]] = {}
+    async with db.execute(
+            """SELECT edge_id, start_minute, end_minute, capacity
+               FROM capacity_controls
+               ORDER BY edge_id, start_minute""") as cur:
+        for edge_id, a, b, cap in await cur.fetchall():
+            capacity_controls.setdefault(edge_id, []).append((a, b, cap))
+
     # 已固定（已出发）组的占用：仅计当前分钟起尚未走完的部分
     minute_now = await get_current_minute(db)
     fixed_load: dict[tuple[int, int], int] = {}
@@ -158,7 +178,8 @@ async def load_world(db: aiosqlite.Connection):
                 fixed_load[key] = fixed_load.get(key, 0) + size
 
     world = World(edges=edges, adjacency=adjacency, exits=exits,
-                  closures=closures, fixed_load=fixed_load)
+                  closures=closures, fixed_load=fixed_load,
+                  capacity_controls=capacity_controls)
 
     async with db.execute(
             """SELECT id, size, origin, earliest_departure, priority,

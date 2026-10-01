@@ -2,18 +2,20 @@
 
 并发安全
 ========
-所有会改变编排结果的请求（初始化场景 / 新增组 / 新增封闭 / 推进分钟）
-由同一把 asyncio 锁串行化，且每个变更在单个 SQLite 事务内整体提交：
+所有会改变编排结果的请求（初始化场景 / 新增组 / 新增封闭 / 登记容量管制 /
+推进分钟）由同一把 asyncio 锁串行化，且每个变更在单个 SQLite 事务内整体提交：
 * 重排未出发组时，先删除这些组的全部旧路线再整体写入新路线，
   不会出现只重排了一部分的中间状态；
 * 容量校验基于"已固定组占用 + 本轮已排入组占用"，锁内逐组累加，
   并发变更不可能超用容量；
 * 新增封闭若与任一已出发（fixed）组剩余路线相交，直接返回 409，
-  数据原样保留、不触发任何重排。
+  数据原样保留、不触发任何重排；
+* 登记容量管制若与同通道已有管制重叠，或新上限使已出发组剩余路线在
+  任一分钟超载，同样整次拒绝（409），不改动任何状态。
 
 修订历史
 ========
-上述四类变更成功提交时，在同一事务内追加一条修订记录：全局递增修订号、
+上述五类变更成功提交时，在同一事务内追加一条修订记录：全局递增修订号、
 触发操作、提交后的当前分钟、提交前后完整编排快照。被拒绝的请求（409/422）
 不产生修订。修订记录不随场景重置或服务重启丢失，历史快照按落库内容
 原样返回，不按当前场景重算。
@@ -30,11 +32,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import db
-from .planner import plan_group
-from .schemas import (ClosureIn, ConflictOut, GroupChangeOut, GroupIn,
-                      GroupPlanOut, PlanResponse, RevisionDetailOut,
-                      RevisionListOut, RevisionSummaryOut, ScenarioIn,
-                      StepOut)
+from .planner import effective_capacity, plan_group
+from .schemas import (CapacityControlIn, CapacityControlListOut,
+                      CapacityControlOut, ClosureIn, ConflictOut,
+                      GroupChangeOut, GroupIn, GroupPlanOut, PlanResponse,
+                      RevisionDetailOut, RevisionListOut, RevisionSummaryOut,
+                      ScenarioIn, StepOut)
 from .seed import SEED_SCENARIO
 
 DB_PATH = os.getenv("EVAC_DB_PATH", "/data/evacuation.db")
@@ -66,9 +69,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.0.0",
+    version="1.1.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
-                "支持封闭时段、每分钟容量约束与增量重排。",
+                "支持封闭时段、容量管制时段、每分钟容量约束与增量重排。",
     lifespan=lifespan,
 )
 
@@ -188,6 +191,41 @@ async def _closure_conflicts(conn: aiosqlite.Connection, edge_id: int,
                 group_id=gid, edge_id=eid, enter_minute=enter_m,
                 exit_minute=exit_m, closure=[a, b]))
     return conflicts
+
+
+async def _capacity_control_conflicts(conn: aiosqlite.Connection,
+                                      edge_id: int, a: int, b: int,
+                                      cap: int) -> list[dict]:
+    """检查新管制上限是否使已出发组在该通道的剩余路线任一分钟超载。
+
+    已出发组的占用永久固定、不参与重排，故新上限必须能容纳其剩余路线
+    的逐分钟占用。返回逐分钟冲突列表：冲突分钟、该分钟占用量、新有效
+    上限与相关组（未出发组会随管制重排，不在检查之列）。
+    """
+    minute_now = await db.get_current_minute(conn)
+    async with conn.execute(
+            "SELECT capacity FROM edges WHERE id=?", (edge_id,)) as cur:
+        base_cap = int((await cur.fetchone())[0])
+    effective = min(base_cap, cap)
+    async with conn.execute(
+            """SELECT g.id, g.size, rs.enter_minute, rs.exit_minute
+               FROM route_steps rs JOIN groups g ON g.id = rs.group_id
+               WHERE g.status='fixed' AND rs.edge_id=?""",
+            (edge_id,)) as cur:
+        rows = await cur.fetchall()
+    per_minute: dict[int, dict] = {}
+    for gid, size, enter_m, exit_m in rows:
+        # 剩余路线 [max(enter, 当前分钟), exit) 与管制 [a, b) 的相交部分
+        for m in range(max(enter_m, minute_now, a), min(exit_m, b)):
+            slot = per_minute.setdefault(m, {"used": 0, "groups": []})
+            slot["used"] += size
+            slot["groups"].append({"group_id": gid, "size": size})
+    return [
+        {"edge_id": edge_id, "minute": m, "used": slot["used"],
+         "effective_capacity": effective, "groups": slot["groups"]}
+        for m, slot in sorted(per_minute.items())
+        if slot["used"] > effective
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -353,6 +391,105 @@ async def add_closure(closure: ClosureIn, request: Request):
         return after
 
 
+@app.post("/capacity-controls", tags=["变更"], response_model=PlanResponse,
+          status_code=201)
+async def add_capacity_control(control: CapacityControlIn, request: Request):
+    """登记左闭右开的容量管制时段（临时限流）。
+
+    管制时段内该通道每分钟有效上限收紧为 min(原容量, 指定上限)，时段外
+    仍为原容量；编排按通行期间每一分钟的有效上限核算，封闭规则照常生效。
+
+    通道不存在、起止无效或起点早于当前分钟时返回 422；与同通道已有管制
+    时段重叠时返回 409；新上限使已出发组剩余路线在任一分钟超载时返回
+    409 并给出冲突分钟、占用量与相关组。以上均整次拒绝、不改动任何
+    状态、不产生修订。成功后仅重排未出发组（已出发组路线保留），
+    登记管制并产生一条修订。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        async with conn.execute(
+                "SELECT 1 FROM edges WHERE id=?",
+                (control.edge_id,)) as cur:
+            if await cur.fetchone() is None:
+                raise HTTPException(422, f"通道 {control.edge_id} 不存在")
+        if control.start_minute < minute_now:
+            raise HTTPException(
+                422, f"管制起点 {control.start_minute} 早于当前分钟 "
+                     f"{minute_now}")
+
+        async with conn.execute(
+                """SELECT start_minute, end_minute FROM capacity_controls
+                   WHERE edge_id=? ORDER BY start_minute""",
+                (control.edge_id,)) as cur:
+            existing = await cur.fetchall()
+        overlaps = [(a, b) for a, b in existing
+                    if control.start_minute < b and a < control.end_minute]
+        if overlaps:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "CAPACITY_CONTROL_OVERLAP",
+                    "message": "同一通道的管制时段不得重叠，整次拒绝",
+                    "conflicts": [
+                        {"edge_id": control.edge_id,
+                         "existing": [a, b],
+                         "requested": [control.start_minute,
+                                       control.end_minute]}
+                        for a, b in overlaps],
+                })
+
+        conflicts = await _capacity_control_conflicts(
+            conn, control.edge_id, control.start_minute, control.end_minute,
+            control.capacity)
+        if conflicts:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "CAPACITY_CONTROL_OVERLOADS_DEPARTED_GROUP",
+                    "message": "新上限使已出发组剩余路线在部分分钟超载，"
+                               "整次拒绝",
+                    "conflicts": conflicts,
+                })
+
+        before = await _build_plan_response(conn)
+        async with db.transaction(conn):
+            await conn.execute(
+                """INSERT INTO capacity_controls
+                   (edge_id, start_minute, end_minute, capacity)
+                   VALUES(?,?,?,?)""",
+                (control.edge_id, control.start_minute, control.end_minute,
+                 control.capacity))
+            await _replan_pending(conn, in_transaction=True)
+            after = await _build_plan_response(conn)
+            await db.insert_revision(conn, "capacity-controls",
+                                     control.model_dump(),
+                                     _plan_dump(before), _plan_dump(after))
+        return after
+
+
+@app.get("/capacity-controls", tags=["查询"],
+         response_model=CapacityControlListOut)
+async def list_capacity_controls(request: Request):
+    """列出当前全部容量管制时段（按通道、开始分钟排序）。
+
+    场景重置会清除全部管制记录；历史管制可通过修订快照追溯。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        async with conn.execute(
+                """SELECT edge_id, start_minute, end_minute, capacity
+                   FROM capacity_controls
+                   ORDER BY edge_id, start_minute""") as cur:
+            rows = await cur.fetchall()
+    return CapacityControlListOut(
+        current_minute=minute_now,
+        controls=[CapacityControlOut(
+            edge_id=row[0], start_minute=row[1], end_minute=row[2],
+            capacity=row[3]) for row in rows])
+
+
 class TickIn(BaseModel):
     minutes: int = Field(1, gt=0, description="推进的分钟数（正整数）")
 
@@ -396,7 +533,12 @@ async def get_plan(request: Request):
 @app.get("/passages/{edge_id}/load", tags=["查询"])
 async def get_edge_load(edge_id: int, request: Request,
                         minute: int | None = None):
-    """查询通道逐分钟占用，便于核验容量；可加 ?minute=n 只看某一分钟。"""
+    """查询通道逐分钟占用与每分钟有效上限，便于核验容量；可加 ?minute=n 只看某一分钟。
+
+    每分钟的有效上限：容量管制时段内为 min(原容量, 管制上限)，时段外为
+    原容量。管制覆盖的分钟即使无占用也会列出（used=0），响应顶层同时
+    给出该通道当前生效的管制时段列表。
+    """
     conn = request.app.state.db
     async with conn.execute("SELECT 1 FROM edges WHERE id=?", (edge_id,)) as cur:
         if await cur.fetchone() is None:
@@ -410,8 +552,6 @@ async def get_edge_load(edge_id: int, request: Request,
         per_minute: dict[int, dict] = {}
         for enter_m, exit_m, size, status, gid in rows:
             for m in range(enter_m, exit_m):
-                if minute is not None and m != minute:
-                    continue
                 slot = per_minute.setdefault(
                     m, {"minute": m, "used": 0, "groups": []})
                 slot["used"] += size
@@ -420,10 +560,31 @@ async def get_edge_load(edge_id: int, request: Request,
         async with conn.execute(
                 "SELECT capacity, minutes FROM edges WHERE id=?", (edge_id,)) as cur:
             cap_row = await cur.fetchone()
-        return {"edge_id": edge_id, "capacity": cap_row[0],
+        base_cap = cap_row[0]
+        async with conn.execute(
+                """SELECT start_minute, end_minute, capacity
+                   FROM capacity_controls WHERE edge_id=?
+                   ORDER BY start_minute""", (edge_id,)) as cur:
+            control_rows = await cur.fetchall()
+        controls = [(a, b, cap) for a, b, cap in control_rows]
+        # 管制覆盖的分钟即使无占用也列出，便于核对管制期间的有效上限
+        for a, b, _cap in controls:
+            for m in range(a, b):
+                per_minute.setdefault(m, {"minute": m, "used": 0, "groups": []})
+        slots = []
+        for m in sorted(per_minute):
+            if minute is not None and m != minute:
+                continue
+            slot = per_minute[m]
+            slot["effective_capacity"] = effective_capacity(
+                base_cap, controls, m)
+            slots.append(slot)
+        return {"edge_id": edge_id, "capacity": base_cap,
                 "traversal_minutes": cap_row[1],
-                "minutes": sorted(per_minute.values(),
-                                  key=lambda x: x["minute"])}
+                "capacity_controls": [
+                    {"edge_id": edge_id, "start_minute": a, "end_minute": b,
+                     "capacity": cap} for a, b, cap in controls],
+                "minutes": slots}
 
 
 @app.get("/revisions", tags=["追溯"], response_model=RevisionListOut)

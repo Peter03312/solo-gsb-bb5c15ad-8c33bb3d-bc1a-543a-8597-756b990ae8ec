@@ -32,6 +32,33 @@ class ClosureIn(BaseModel):
         return self
 
 
+class CapacityControlIn(BaseModel):
+    edge_id: int = Field(..., description="被管制的通道编号")
+    start_minute: int = Field(..., ge=0, description="管制开始分钟（含，须不早于当前分钟）")
+    end_minute: int = Field(..., ge=0, description="管制结束分钟（不含）")
+    capacity: int = Field(..., gt=0,
+                          description="管制时段内每分钟人数上限（正整数）")
+
+    @model_validator(mode="after")
+    def _half_open(self):
+        if self.end_minute <= self.start_minute:
+            raise ValueError(
+                "管制时段需为左闭右开：end_minute 必须大于 start_minute")
+        return self
+
+
+class CapacityControlOut(BaseModel):
+    edge_id: int
+    start_minute: int
+    end_minute: int
+    capacity: int
+
+
+class CapacityControlListOut(BaseModel):
+    current_minute: int
+    controls: list[CapacityControlOut]
+
+
 class GroupIn(BaseModel):
     id: int = Field(..., ge=1, description="人群组编号（正整数，唯一）")
     size: int = Field(..., gt=0, description="人数（正整数，整组不可拆分）")
@@ -108,7 +135,8 @@ class RevisionSummaryOut(BaseModel):
     rev: int = Field(description="全局递增修订号（按实际提交顺序编号）")
     operation: str = Field(
         description="触发操作：scenario=场景重置 | groups=新增人群组 | "
-                    "closures=登记封闭 | tick=时间推进")
+                    "closures=登记封闭 | capacity-controls=登记容量管制 | "
+                    "tick=时间推进")
     minute: int = Field(description="该修订提交后的当前分钟")
     detail: dict = Field(default_factory=dict, description="触发操作的参数摘要")
 

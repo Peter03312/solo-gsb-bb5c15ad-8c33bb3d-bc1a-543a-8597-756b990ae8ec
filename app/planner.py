@@ -9,7 +9,10 @@
   相交（即 ``t < b 且 a < t+w``），就不允许在第 ``t`` 分钟进入该通道；
   最早可尝试进入的下一分钟为 ``b``。
 * 容量按每分钟核算：同一通道同一分钟，所有在途组（已出发固定组 + 本轮
-  已排入的待出发组）人数之和不得超过该通道每分钟容量。
+  已排入的待出发组）人数之和不得超过该通道该分钟的有效上限。
+* 容量管制：可为通道登记左闭右开的管制时段 ``[a, b)`` 及时段内每分钟
+  上限；同一通道的管制时段互不重叠。管制时段内有效上限取
+  ``min(原容量, 管制上限)``（管制只收紧不放松），时段外仍为原容量。
 
 择优规则
 --------
@@ -47,10 +50,29 @@ class World:
     closures: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
     # (edge_id, minute) -> 已固定（已出发）组在该分钟占用的总人数
     fixed_load: dict[tuple[int, int], int] = field(default_factory=dict)
+    # edge_id -> 已按开始分钟升序排列、互不重叠的 [(a, b, 时段内上限), ...]
+    capacity_controls: dict[int, list[tuple[int, int, int]]] = \
+        field(default_factory=dict)
 
 
 class PlanningError(Exception):
     """规划过程内部错误（如图结构异常等）。"""
+
+
+def effective_capacity(base_capacity: int,
+                       controls: list[tuple[int, int, int]] | tuple,
+                       minute: int) -> int:
+    """通道某分钟的有效上限。
+
+    管制时段 ``[a, b)`` 内取 ``min(原容量, 管制上限)``（管制只收紧不
+    放松），时段外为原容量。``controls`` 需按开始分钟升序且互不重叠。
+    """
+    for a, b, cap in controls:
+        if a > minute:
+            break
+        if minute < b:
+            return min(base_capacity, cap)
+    return base_capacity
 
 
 def _dominates(a_time: int, a_seq: tuple[int, ...],
@@ -64,8 +86,9 @@ def earliest_entry(edge: Edge, start: int, size: int, world: World,
                    use_loads: bool) -> Optional[int]:
     """返回最早的可进入分钟 t >= start，使 [t, t+w) 完全可用。
 
-    不可用包括：与封闭时段相交、某一分钟容量不足。均不满足（或无法在
-    horizon 前完成通行）时返回 None。
+    不可用包括：与封闭时段相交、某一分钟占用达到该分钟有效上限（容量
+    管制时段内为 min(原容量, 管制上限)）。均不满足（或无法在 horizon
+    前完成通行）时返回 None。
     """
     eid = edge.id
     w = edge.minutes
@@ -90,11 +113,20 @@ def earliest_entry(edge: Edge, start: int, size: int, world: World,
         if use_loads:
             if size > edge.capacity:
                 return None  # 单组人数已超通道每分钟容量，永不可通行
+            controls = world.capacity_controls.get(eid, ())
             for minute in range(t, t + w):
+                cap = effective_capacity(edge.capacity, controls, minute)
                 used = world.fixed_load.get((eid, minute), 0)
-                if used + size > edge.capacity:
-                    # 容量冲突的这一分钟不能进入；下一分钟再尝试
-                    t = minute + 1
+                if used + size > cap:
+                    if size > cap:
+                        # 单组人数已超该分钟有效上限（管制收紧所致，此时
+                        # size <= 原容量，故该分钟必在管制时段内）：整个
+                        # 管制时段均不可进入，直接跳到管制结束分钟再试
+                        t = next(b for a, b, _c in controls
+                                 if a <= minute < b)
+                    else:
+                        # 容量冲突的这一分钟不能进入；下一分钟再尝试
+                        t = minute + 1
                     advanced = True
                     break
             if advanced:
